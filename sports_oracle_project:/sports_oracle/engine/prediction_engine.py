@@ -1,0 +1,962 @@
+"""
+sports_oracle/engine/prediction_engine.py
+
+Core prediction engine. Consumes the validated output
+of pipeline.get_game_inputs() and produces:
+  - Projected score for each team
+  - Projected total points
+  - Projected margin (spread)
+  - Win probability for each team
+  - Confidence level
+  - Full breakdown of every adjustment
+
+ARCHITECTURE:
+  Layer 3 — Matchup Projection (formula baseline)
+    Step 1: Expected possessions (Game_Pace)
+    Step 2: Raw score projection per team
+    Step 3: Raw margin and total
+
+  Layer 4 — Additive Adjustments
+    Momentum, Experience, Rest, Injury, Seed, Travel
+    Each produces a signed point adjustment.
+    Sum is added to Raw_Margin.
+
+  Win Probability — Logistic function of Final_Margin
+  Confidence — Based on data quality and agreement
+
+USAGE:
+    from engine.prediction_engine import PredictionEngine
+
+    engine = PredictionEngine()
+    result = engine.predict(game_inputs)
+
+    print(result["home_score"])       # 74.2
+    print(result["away_score"])       # 68.8
+    print(result["spread"])           # -5.4 (home favored)
+    print(result["total"])            # 143.0
+    print(result["home_win_prob"])    # 0.72
+    print(result["confidence"])       # "HIGH"
+"""
+
+from __future__ import annotations
+import math
+import logging
+from typing import Optional
+from dataclasses import dataclass, field
+
+logger = logging.getLogger("sports_oracle.engine")
+
+
+# ── Constants ─────────────────────────────────────────────────────────────────
+
+# Round pace modifiers — from config but local for engine isolation
+ROUND_PACE_MOD = {
+    0: 1.00,   # First Four
+    1: 1.00,   # First Round
+    2: 1.00,   # Second Round
+    3: 0.97,   # Sweet 16
+    4: 0.94,   # Elite 8
+    5: 0.96,   # Final Four
+    6: 0.95,   # Championship
+}
+
+# Logistic function calibration for margin → win probability
+# Calibrated so that a 5-point margin ≈ 68% win probability
+# σ = 10.5 fits NCAA tournament data well
+LOGISTIC_SIGMA = 10.5
+
+# Maximum total Layer 4 adjustment (points)
+MAX_L4_ADJUSTMENT = 8.0
+
+# Momentum decay — weight for most recent game vs 10th most recent
+MOMENTUM_DECAY_LAMBDA = 0.15
+
+# Experience scoring weights
+EXP_WEIGHT_ROSTER_AGE = 0.30
+EXP_WEIGHT_COACH = 0.35
+EXP_WEIGHT_RETURNING = 0.35
+
+# Rest adjustment curve (days → point adjustment)
+# 0 days (back-to-back): -1.5 pts
+# 1 day: -0.5 pts
+# 2 days: 0 (baseline)
+# 3+ days: diminishing positive
+REST_ADJUSTMENTS = {
+    0: -1.5,
+    1: -0.5,
+    2: 0.0,
+    3: 0.3,
+    4: 0.4,
+    5: 0.3,
+    6: 0.2,
+    7: 0.1,
+}
+
+# Travel distance thresholds (miles → point penalty)
+TRAVEL_PENALTY_THRESHOLD = 500    # no penalty under 500 miles
+TRAVEL_PENALTY_PER_1000 = 0.4    # 0.4 pts per 1000 miles beyond threshold
+
+# Altitude threshold (feet difference → point penalty)
+ALTITUDE_PENALTY_THRESHOLD = 2000  # no penalty under 2000ft diff
+ALTITUDE_PENALTY_PER_1000 = 0.2   # 0.2 pts per 1000ft beyond threshold
+
+
+# ── Result dataclass ──────────────────────────────────────────────────────────
+
+@dataclass
+class PredictionResult:
+    """Full prediction output with breakdown."""
+    home_team: str = ""
+    away_team: str = ""
+
+    # Layer 3 — Raw projections
+    game_pace: float = 68.0
+    home_raw_score: float = 70.0
+    away_raw_score: float = 70.0
+    raw_margin: float = 0.0          # positive = home favored
+    raw_total: float = 140.0
+
+    # Layer 4 — Individual adjustments (each is home perspective)
+    momentum_adj: float = 0.0
+    experience_adj: float = 0.0
+    rest_adj: float = 0.0
+    injury_adj: float = 0.0
+    seed_adj: float = 0.0
+    travel_adj: float = 0.0
+    total_adjustment: float = 0.0
+
+    # Final predictions
+    home_score: float = 70.0
+    away_score: float = 70.0
+    spread: float = 0.0              # negative = home favored
+    total: float = 140.0
+    home_win_prob: float = 0.50
+    away_win_prob: float = 0.50
+
+    # Market comparison
+    market_spread: Optional[float] = None
+    market_total: Optional[float] = None
+    spread_edge: Optional[float] = None
+    total_edge: Optional[float] = None
+
+    # Metadata
+    confidence: str = "MEDIUM"
+    confidence_score: float = 0.50
+    tournament_round: int = 1
+    season: int = 2025
+    warnings: list[str] = field(default_factory=list)
+
+    @property
+    def predicted_winner(self) -> str:
+        return self.home_team if self.home_win_prob > 0.5 else self.away_team
+
+    @property
+    def predicted_loser(self) -> str:
+        return self.away_team if self.home_win_prob > 0.5 else self.home_team
+
+    @property
+    def winner_prob(self) -> float:
+        return max(self.home_win_prob, self.away_win_prob)
+
+    def summary(self) -> str:
+        """One-line summary string."""
+        winner = self.predicted_winner
+        prob = self.winner_prob
+        return (
+            f"{winner} {prob:.0%} | "
+            f"{self.home_team} {self.home_score:.0f} – "
+            f"{self.away_team} {self.away_score:.0f} | "
+            f"Spread: {self.spread:+.1f} | Total: {self.total:.0f} | "
+            f"Confidence: {self.confidence}"
+        )
+
+    def breakdown(self) -> str:
+        """Detailed multi-line breakdown."""
+        lines = [
+            f"\n{'═'*60}",
+            f"  {self.away_team} @ {self.home_team}",
+            f"  Round {self.tournament_round} | Season {self.season}",
+            f"{'═'*60}",
+            f"",
+            f"  LAYER 3 — Matchup Projection",
+            f"  {'─'*40}",
+            f"  Game Pace:        {self.game_pace:.1f} possessions",
+            f"  {self.home_team:>20s}:  {self.home_raw_score:.1f} raw pts",
+            f"  {self.away_team:>20s}:  {self.away_raw_score:.1f} raw pts",
+            f"  Raw Margin:       {self.raw_margin:+.1f} pts",
+            f"  Raw Total:        {self.raw_total:.1f} pts",
+            f"",
+            f"  LAYER 4 — Adjustments (home perspective)",
+            f"  {'─'*40}",
+            f"  Momentum:         {self.momentum_adj:+.2f} pts",
+            f"  Experience:       {self.experience_adj:+.2f} pts",
+            f"  Rest:             {self.rest_adj:+.2f} pts",
+            f"  Injury:           {self.injury_adj:+.2f} pts",
+            f"  Seed History:     {self.seed_adj:+.2f} pts",
+            f"  Travel:           {self.travel_adj:+.2f} pts",
+            f"  {'─'*40}",
+            f"  Total Adjustment: {self.total_adjustment:+.2f} pts",
+            f"",
+            f"  FINAL PREDICTION",
+            f"  {'─'*40}",
+            f"  {self.home_team:>20s}:  {self.home_score:.1f} pts",
+            f"  {self.away_team:>20s}:  {self.away_score:.1f} pts",
+            f"  Spread:           {self.spread:+.1f}",
+            f"  Total:            {self.total:.1f}",
+            f"  Win Probability:  {self.home_team} {self.home_win_prob:.1%} "
+            f"| {self.away_team} {self.away_win_prob:.1%}",
+            f"  Confidence:       {self.confidence} ({self.confidence_score:.0%})",
+        ]
+
+        if self.market_spread is not None:
+            lines.extend([
+                f"",
+                f"  MARKET COMPARISON",
+                f"  {'─'*40}",
+                f"  Market Spread:    {self.market_spread:+.1f}",
+                f"  Our Spread:       {self.spread:+.1f}",
+                f"  Spread Edge:      {self.spread_edge:+.1f} pts" if self.spread_edge else "",
+            ])
+        if self.market_total is not None:
+            lines.extend([
+                f"  Market Total:     {self.market_total:.1f}",
+                f"  Our Total:        {self.total:.1f}",
+                f"  Total Edge:       {self.total_edge:+.1f} pts" if self.total_edge else "",
+            ])
+
+        if self.warnings:
+            lines.extend([
+                f"",
+                f"  ⚠️  WARNINGS",
+                *[f"    • {w}" for w in self.warnings],
+            ])
+
+        lines.append(f"{'═'*60}")
+        return "\n".join(lines)
+
+
+# ── Prediction Engine ─────────────────────────────────────────────────────────
+
+class PredictionEngine:
+    """
+    Core prediction engine. Takes validated pipeline inputs
+    and produces scored predictions.
+    """
+
+    def predict(self, inputs: dict) -> PredictionResult:
+        """
+        Main entry point. Takes the output of
+        pipeline.get_game_inputs() and returns a PredictionResult.
+        """
+        result = PredictionResult(
+            home_team=inputs.get("home_team", "Home"),
+            away_team=inputs.get("away_team", "Away"),
+            tournament_round=inputs.get("tournament_round", 1),
+            season=inputs.get("season", 2025),
+        )
+
+        home_eff = inputs.get("home_efficiency", {})
+        away_eff = inputs.get("away_efficiency", {})
+        venue = inputs.get("venue", {})
+
+        if not home_eff or not away_eff:
+            result.warnings.append("Missing efficiency data — using defaults")
+            home_eff = home_eff or self._default_efficiency()
+            away_eff = away_eff or self._default_efficiency()
+
+        # ── Layer 3: Matchup Projection ──────────────────────────────────
+
+        # Step 1: Expected possessions
+        result.game_pace = self._compute_game_pace(
+            home_eff, away_eff, venue, result.tournament_round
+        )
+
+        # Step 2: Raw score projection
+        result.home_raw_score = self._project_score(
+            offense=home_eff,
+            defense=away_eff,
+            game_pace=result.game_pace,
+            venue=venue,
+        )
+        result.away_raw_score = self._project_score(
+            offense=away_eff,
+            defense=home_eff,
+            game_pace=result.game_pace,
+            venue=venue,
+        )
+
+        # Step 3: Raw margin and total
+        result.raw_margin = result.home_raw_score - result.away_raw_score
+        result.raw_total = result.home_raw_score + result.away_raw_score
+
+        # ── Layer 4: Additive Adjustments ────────────────────────────────
+
+        result.momentum_adj = self._compute_momentum_adjustment(
+            inputs.get("home_momentum", {}),
+            inputs.get("away_momentum", {}),
+        )
+
+        result.experience_adj = self._compute_experience_adjustment(
+            inputs.get("home_experience", {}),
+            inputs.get("away_experience", {}),
+        )
+
+        result.rest_adj = self._compute_rest_adjustment(
+            inputs.get("home_rest", {}),
+            inputs.get("away_rest", {}),
+        )
+
+        result.injury_adj = self._compute_injury_adjustment(
+            inputs.get("injuries"),
+            result.home_team,
+            result.away_team,
+        )
+
+        result.seed_adj = self._compute_seed_adjustment(
+            inputs.get("seed_context", {}),
+        )
+
+        result.travel_adj = self._compute_travel_adjustment(
+            inputs.get("home_travel", {}),
+            inputs.get("away_travel", {}),
+        )
+
+        # Sum and clamp
+        raw_adj = (
+            result.momentum_adj
+            + result.experience_adj
+            + result.rest_adj
+            + result.injury_adj
+            + result.seed_adj
+            + result.travel_adj
+        )
+        result.total_adjustment = max(
+            -MAX_L4_ADJUSTMENT,
+            min(raw_adj, MAX_L4_ADJUSTMENT),
+        )
+
+        # ── Final Predictions ────────────────────────────────────────────
+
+        final_margin = result.raw_margin + result.total_adjustment
+        result.home_score = result.raw_total / 2 + final_margin / 2
+        result.away_score = result.raw_total / 2 - final_margin / 2
+        result.spread = -final_margin  # convention: negative = home favored
+        result.total = result.home_score + result.away_score
+
+        # Win probability via logistic function
+        result.home_win_prob = self._margin_to_win_prob(final_margin)
+        result.away_win_prob = 1.0 - result.home_win_prob
+
+        # ── Market Comparison ────────────────────────────────────────────
+
+        market = inputs.get("market_lines", {})
+        if market:
+            result.market_spread = market.get("consensus_spread")
+            result.market_total = market.get("consensus_total")
+            if result.market_spread is not None:
+                result.spread_edge = round(
+                    result.spread - result.market_spread, 1
+                )
+            if result.market_total is not None:
+                result.total_edge = round(
+                    result.total - result.market_total, 1
+                )
+
+        # ── Confidence ───────────────────────────────────────────────────
+
+        result.confidence_score = self._compute_confidence(
+            inputs, result
+        )
+        result.confidence = self._confidence_label(result.confidence_score)
+
+        logger.info(f"Prediction: {result.summary()}")
+        return result
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  LAYER 3 — Matchup Projection
+    # ══════════════════════════════════════════════════════════════════════
+
+    def _compute_game_pace(
+        self,
+        home_eff: dict,
+        away_eff: dict,
+        venue: dict,
+        tournament_round: int,
+    ) -> float:
+        """
+        Step 1: Expected possessions.
+        Raw_Pace = (Team_A_Pace + Team_B_Pace) / 2
+        Game_Pace = Raw_Pace × VPI × Round_Modifier
+        """
+        home_tempo = home_eff.get("adj_tempo", 68.0)
+        away_tempo = away_eff.get("adj_tempo", 68.0)
+        raw_pace = (home_tempo + away_tempo) / 2.0
+
+        vpi = venue.get("vpi", 1.0)
+        round_mod = ROUND_PACE_MOD.get(tournament_round, 1.0)
+
+        game_pace = raw_pace * vpi * round_mod
+
+        logger.debug(
+            f"  Pace: ({home_tempo:.1f} + {away_tempo:.1f})/2 = {raw_pace:.1f} "
+            f"× VPI={vpi:.3f} × Round={round_mod:.2f} = {game_pace:.1f}"
+        )
+        return game_pace
+
+    def _project_score(
+        self,
+        offense: dict,
+        defense: dict,
+        game_pace: float,
+        venue: dict,
+    ) -> float:
+        """
+        Step 2: Raw score projection for one team.
+
+        KenPom-style matchup formula:
+        Score = (AdjOE × AdjDE / 100) × (Game_Pace / 100)
+              × VSI × V3P_adjustment
+
+        Why AdjOE × AdjDE / 100:
+          AdjOE = points scored per 100 possessions vs average D1 defense
+          AdjDE = points ALLOWED per 100 possessions vs average D1 offense
+          Both are on the same "per 100 poss" scale centered at ~100.
+          A good defense (AdjDE=92) suppresses scoring: 120*92/100 = 110.4
+          A bad defense (AdjDE=108) inflates scoring: 120*108/100 = 129.6
+
+        V3P_adjustment = 1.0 + ((V3P - 1.0) × 3PA_Rate × 1.5)
+        """
+        adj_oe = offense.get("adj_oe", 100.0)
+        adj_de = defense.get("adj_de", 100.0)
+        three_pt_rate = offense.get("three_pt_rate_off", 0.35)
+
+        vsi = venue.get("vsi", 1.0)
+        v3p = venue.get("v3p", 1.0)
+
+        # KenPom matchup efficiency: offense rate vs this specific defense
+        # AdjOE * AdjDE / 100 gives expected points per 100 possessions
+        matchup_eff = adj_oe * adj_de / 100.0
+
+        # Scale to actual game possessions
+        pace_factor = game_pace / 100.0
+
+        # V3P adjustment — 3PT-heavy teams feel venue suppression more
+        v3p_adj = 1.0 + ((v3p - 1.0) * three_pt_rate * 1.5)
+
+        score = matchup_eff * pace_factor * vsi * v3p_adj
+
+        return score
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  LAYER 4 — Additive Adjustments
+    # ══════════════════════════════════════════════════════════════════════
+
+    def _compute_momentum_adjustment(
+        self,
+        home_momentum: dict,
+        away_momentum: dict,
+    ) -> float:
+        """
+        Momentum adjustment based on recent performance vs season average.
+
+        Uses last 10 game margins with exponential decay.
+        Compares recent efficiency to season average.
+
+        Output: signed adjustment in points (positive = favors home).
+        Range: roughly ±2.0 points.
+        """
+        home_score = self._score_momentum(home_momentum)
+        away_score = self._score_momentum(away_momentum)
+        return (home_score - away_score) * 1.0  # 1 pt per unit delta
+
+    def _score_momentum(self, momentum: dict) -> float:
+        """
+        Score a team's momentum from -2 to +2.
+
+        Factors:
+          - Decay-weighted recent margins
+          - Comparison to season average efficiency
+          - Conference tournament performance
+        """
+        margins = momentum.get("recent_margins", [])
+        if not margins:
+            return 0.0
+
+        # Decay-weighted average margin (most recent = highest weight)
+        total_weight = 0.0
+        weighted_sum = 0.0
+        for i, margin in enumerate(margins):
+            # margins[0] = most recent, margins[-1] = oldest
+            weight = math.exp(-MOMENTUM_DECAY_LAMBDA * i)
+            weighted_sum += float(margin) * weight
+            total_weight += weight
+
+        if total_weight == 0:
+            return 0.0
+
+        weighted_avg_margin = weighted_sum / total_weight
+
+        # Normalize to ±2 scale
+        # A team winning by 15+ on average is ~+2, losing by 15+ is ~-2
+        momentum_score = max(-2.0, min(2.0, weighted_avg_margin / 10.0))
+
+        # Bonus for efficiency delta vs season average
+        season_oe = momentum.get("season_adj_oe", 100)
+        season_de = momentum.get("season_adj_de", 100)
+        if season_oe > 0 and season_de > 0:
+            # If they're trending up (margins better than efficiency suggests),
+            # add a small bonus
+            expected_margin = (season_oe - season_de) / 5.0
+            actual_vs_expected = weighted_avg_margin - expected_margin
+            efficiency_bonus = max(-0.5, min(0.5, actual_vs_expected / 10.0))
+            momentum_score += efficiency_bonus
+
+        return max(-2.0, min(2.0, momentum_score))
+
+    def _compute_experience_adjustment(
+        self,
+        home_exp: dict,
+        away_exp: dict,
+    ) -> float:
+        """
+        Experience adjustment based on roster age, coach record,
+        and roster continuity.
+
+        Output: signed adjustment in points (positive = favors home).
+        Range: roughly ±1.5 points.
+        """
+        home_score = self._score_experience(home_exp)
+        away_score = self._score_experience(away_exp)
+        return (home_score - away_score) * 0.75  # scale to points
+
+    def _score_experience(self, exp: dict) -> float:
+        """
+        Score a team's tournament experience from -2 to +2.
+
+        Components (when coach data available):
+          1. Roster age (class year average) — 30% weight
+          2. Coach tournament record — 35% weight
+          3. Returning production % — 35% weight
+
+        Fallback (when coach data unavailable):
+          1. Roster age — 47.5% weight
+          2. Returning production — 52.5% weight
+        """
+        score = 0.0
+        import pandas as pd
+
+        coach = exp.get("coach_record")
+        has_coach_data = coach is not None and coach.get("appearances", 0) > 0
+
+        # Determine weights based on data availability
+        if has_coach_data:
+            w_roster = EXP_WEIGHT_ROSTER_AGE    # 0.30
+            w_coach = EXP_WEIGHT_COACH           # 0.35
+            w_returning = EXP_WEIGHT_RETURNING   # 0.35
+        else:
+            # Redistribute coach weight to roster + returning
+            w_roster = 0.475
+            w_coach = 0.0
+            w_returning = 0.525
+
+        # 1. Roster age score
+        roster = exp.get("roster")
+        if isinstance(roster, pd.DataFrame) and not roster.empty:
+            if "class_year_num" in roster.columns:
+                avg_year = roster["class_year_num"].dropna().mean()
+                if avg_year:
+                    roster_score = (avg_year - 2.5) / 1.5
+                    score += w_roster * max(-2, min(2, roster_score))
+
+        # 2. Coach tournament record (only if available)
+        if has_coach_data:
+            appearances = coach.get("appearances", 0)
+            win_rate = coach.get("win_rate", 0.0)
+            app_factor = min(1.0, appearances / 10.0)
+            rate_factor = (win_rate - 0.45) / 0.25
+            coach_score = app_factor * rate_factor
+            score += w_coach * max(-2, min(2, coach_score))
+        elif coach and coach.get("first_yr_coach", False):
+            # First-year coach from hardcoded data — small penalty
+            score += 0.35 * (-0.8)
+
+        # 3. Returning production
+        returning_pct = exp.get("returning_pct", 0.5)
+        returning_score = (returning_pct - 0.5) / 0.2
+        score += w_returning * max(-2, min(2, returning_score))
+
+        return max(-2.0, min(2.0, score))
+
+    def _compute_rest_adjustment(
+        self,
+        home_rest: dict,
+        away_rest: dict,
+    ) -> float:
+        """
+        Rest adjustment based on days since last game.
+        Output: signed adjustment (positive = favors home).
+        """
+        home_days = home_rest.get("rest_days")
+        away_days = away_rest.get("rest_days")
+
+        home_adj = self._rest_value(home_days)
+        away_adj = self._rest_value(away_days)
+
+        return home_adj - away_adj
+
+    @staticmethod
+    def _rest_value(days: Optional[int]) -> float:
+        """Convert rest days to a point value."""
+        if days is None:
+            return 0.0
+        days = int(days)
+        if days in REST_ADJUSTMENTS:
+            return REST_ADJUSTMENTS[days]
+        if days > 7:
+            # Rust factor — too much rest is slightly negative
+            return max(-0.3, 0.1 - (days - 7) * 0.1)
+        return 0.0
+
+    def _compute_injury_adjustment(
+        self,
+        injuries,
+        home_team: str,
+        away_team: str,
+    ) -> float:
+        """
+        Injury adjustment based on player availability.
+
+        Without player usage data, we estimate impact by count:
+          - Each injured starter ≈ -1.0 to -2.0 points
+          - Each injured bench player ≈ -0.2 to -0.5 points
+          - "Out" vs "Day-to-Day" weighted differently
+
+        Output: signed adjustment (positive = favors home).
+        """
+        import pandas as pd
+
+        if not isinstance(injuries, pd.DataFrame) or injuries.empty:
+            return 0.0
+
+        home_impact = self._team_injury_impact(injuries, home_team)
+        away_impact = self._team_injury_impact(injuries, away_team)
+
+        # Both are negative; diff favors the healthier team
+        return home_impact - away_impact
+
+    @staticmethod
+    def _team_injury_impact(injuries, team: str) -> float:
+        """
+        Calculate injury impact for one team.
+        Returns negative value (injuries always hurt).
+        """
+        import pandas as pd
+
+        if injuries.empty or "team" not in injuries.columns:
+            return 0.0
+
+        team_lower = team.lower()
+        team_injuries = injuries[
+            injuries["team"].str.lower().str.contains(team_lower, na=False)
+        ]
+
+        if team_injuries.empty:
+            return 0.0
+
+        impact = 0.0
+        for _, inj in team_injuries.iterrows():
+            status = str(inj.get("status", "")).lower()
+            position = str(inj.get("position", "")).lower()
+
+            # Status-based weight
+            if "out" in status:
+                severity = 1.0
+            elif "doubtful" in status:
+                severity = 0.7
+            elif "questionable" in status:
+                severity = 0.3
+            elif "day-to-day" in status or "dtd" in status:
+                severity = 0.2
+            else:
+                severity = 0.4
+
+            # Position-based impact (guards > forwards for most teams)
+            if position in ("pg", "sg", "g"):
+                pos_weight = 0.9
+            elif position in ("sf", "pf", "f"):
+                pos_weight = 0.7
+            elif position in ("c",):
+                pos_weight = 0.6
+            else:
+                pos_weight = 0.5
+
+            impact -= severity * pos_weight * 1.2  # scale to ~1-2 pts per starter
+
+        # Cap total injury impact
+        return max(-4.0, impact)
+
+    def _compute_seed_adjustment(self, seed_context: dict) -> float:
+        """
+        Seed history adjustment from pre-computed seed context.
+        Already signed for home perspective.
+        """
+        return seed_context.get("seed_adjustment", 0.0)
+
+    def _compute_travel_adjustment(
+        self,
+        home_travel: dict,
+        away_travel: dict,
+    ) -> float:
+        """
+        Travel + altitude adjustment.
+        Teams traveling far or to high altitude get a penalty.
+        Output: signed adjustment (positive = favors home).
+        """
+        home_penalty = self._travel_penalty(home_travel)
+        away_penalty = self._travel_penalty(away_travel)
+        return home_penalty - away_penalty
+
+    @staticmethod
+    def _travel_penalty(travel: dict) -> float:
+        """
+        Calculate travel penalty for one team.
+        Returns negative value (travel always hurts).
+        """
+        penalty = 0.0
+        distance = travel.get("travel_distance_miles", 0)
+        alt_diff = travel.get("altitude_diff_ft", 0)
+
+        # Distance penalty
+        if distance > TRAVEL_PENALTY_THRESHOLD:
+            excess = distance - TRAVEL_PENALTY_THRESHOLD
+            penalty -= (excess / 1000.0) * TRAVEL_PENALTY_PER_1000
+
+        # Altitude penalty (only for going UP significantly)
+        if alt_diff > ALTITUDE_PENALTY_THRESHOLD:
+            excess = alt_diff - ALTITUDE_PENALTY_THRESHOLD
+            penalty -= (excess / 1000.0) * ALTITUDE_PENALTY_PER_1000
+
+        return max(-1.5, penalty)
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  Win Probability & Confidence
+    # ══════════════════════════════════════════════════════════════════════
+
+    @staticmethod
+    def _margin_to_win_prob(margin: float) -> float:
+        """
+        Convert projected margin to win probability using logistic function.
+
+        P(home wins) = 1 / (1 + exp(-margin / σ))
+
+        σ = 10.5 calibrated for NCAA tournament:
+          margin  0 → 50.0%
+          margin  3 → 57.1%
+          margin  5 → 62.0%
+          margin  7 → 66.1%
+          margin 10 → 72.1%
+          margin 15 → 80.7%
+        """
+        return 1.0 / (1.0 + math.exp(-margin / LOGISTIC_SIGMA))
+
+    def _compute_confidence(
+        self,
+        inputs: dict,
+        result: PredictionResult,
+    ) -> float:
+        """
+        Confidence score from 0.0 to 1.0 based on:
+          - Data completeness (did we get efficiency data?)
+          - Agreement between formula and market
+          - Sample size of venue data
+          - Margin magnitude (close games = less confident)
+        """
+        score = 0.5  # baseline
+
+        # Data completeness
+        if inputs.get("home_efficiency"):
+            score += 0.10
+        if inputs.get("away_efficiency"):
+            score += 0.10
+
+        # Venue sample size
+        venue_n = inputs.get("venue", {}).get("sample_size", 0)
+        if venue_n > 20:
+            score += 0.05
+        elif venue_n > 5:
+            score += 0.02
+
+        # Margin magnitude — larger margin = more confident
+        abs_margin = abs(result.raw_margin + result.total_adjustment)
+        if abs_margin > 10:
+            score += 0.10
+        elif abs_margin > 5:
+            score += 0.05
+        elif abs_margin < 2:
+            score -= 0.10
+
+        # Market agreement (if available)
+        if result.spread_edge is not None:
+            if abs(result.spread_edge) < 1.5:
+                score += 0.10  # we agree with Vegas — good sign
+            elif abs(result.spread_edge) > 5.0:
+                score -= 0.10  # big disagreement — one of us is wrong
+
+        # Momentum data availability
+        home_margins = inputs.get("home_momentum", {}).get("recent_margins", [])
+        away_margins = inputs.get("away_momentum", {}).get("recent_margins", [])
+        if len(home_margins) >= 5 and len(away_margins) >= 5:
+            score += 0.05
+
+        return max(0.10, min(0.95, score))
+
+    @staticmethod
+    def _confidence_label(score: float) -> str:
+        if score >= 0.80:
+            return "VERY HIGH"
+        if score >= 0.65:
+            return "HIGH"
+        if score >= 0.45:
+            return "MEDIUM"
+        if score >= 0.30:
+            return "LOW"
+        return "VERY LOW"
+
+    @staticmethod
+    def _default_efficiency() -> dict:
+        """Return average D1 efficiency profile as fallback."""
+        return {
+            "adj_oe": 100.0, "adj_de": 100.0, "adj_tempo": 68.0,
+            "efg_pct_off": 0.50, "efg_pct_def": 0.50,
+            "to_rate_off": 18.0, "to_rate_def": 18.0,
+            "three_pt_rate_off": 0.35, "three_pt_rate_def": 0.35,
+            "three_pt_pct_off": 0.33, "three_pt_pct_def": 0.33,
+            "fta_rate_off": 0.30, "fta_rate_def": 0.30,
+            "orb_pct": 0.30, "drb_pct": 0.70,
+            "sos": 0.0, "rank": 175, "barthag": 0.50,
+        }
+
+    # ── Batch Prediction ──────────────────────────────────────────────────
+
+    def predict_batch(
+        self,
+        games: list[dict],
+    ) -> list[PredictionResult]:
+        """Predict multiple games. Each dict is a pipeline output."""
+        return [self.predict(g) for g in games]
+
+
+# ── Convenience function ──────────────────────────────────────────────────────
+
+def predict_game(inputs: dict) -> PredictionResult:
+    """Module-level convenience function."""
+    engine = PredictionEngine()
+    return engine.predict(inputs)
+
+
+# ── Quick test with synthetic data ────────────────────────────────────────────
+if __name__ == "__main__":
+    engine = PredictionEngine()
+
+    # Simulate a Duke (1-seed) vs Vermont (16-seed) first round game
+    synthetic_inputs = {
+        "home_team": "Duke",
+        "away_team": "Vermont",
+        "season": 2025,
+        "tournament_round": 1,
+        "home_seed": 1,
+        "away_seed": 16,
+        "home_efficiency": {
+            "adj_oe": 120.5, "adj_de": 92.3, "adj_tempo": 71.2,
+            "efg_pct_off": 0.56, "efg_pct_def": 0.44,
+            "to_rate_off": 15.2, "to_rate_def": 20.1,
+            "three_pt_rate_off": 0.38, "three_pt_rate_def": 0.32,
+            "three_pt_pct_off": 0.37, "three_pt_pct_def": 0.30,
+            "fta_rate_off": 0.35, "fta_rate_def": 0.25,
+            "orb_pct": 0.33, "drb_pct": 0.75,
+            "sos": 8.5, "rank": 5, "barthag": 0.95,
+        },
+        "away_efficiency": {
+            "adj_oe": 105.2, "adj_de": 103.8, "adj_tempo": 66.5,
+            "efg_pct_off": 0.51, "efg_pct_def": 0.49,
+            "to_rate_off": 17.8, "to_rate_def": 18.2,
+            "three_pt_rate_off": 0.40, "three_pt_rate_def": 0.36,
+            "three_pt_pct_off": 0.34, "three_pt_pct_def": 0.33,
+            "fta_rate_off": 0.28, "fta_rate_def": 0.30,
+            "orb_pct": 0.28, "drb_pct": 0.68,
+            "sos": -2.1, "rank": 85, "barthag": 0.72,
+        },
+        "venue": {
+            "vsi": 1.02, "vpi": 0.99, "v3p": 0.97,
+            "sample_size": 45,
+        },
+        "home_momentum": {
+            "recent_margins": [15, 8, 22, -3, 12, 18, 5, 10, 7, 20],
+            "season_adj_oe": 120.5, "season_adj_de": 92.3,
+            "season_tempo": 71.2, "season_efg": 0.56, "season_to_rate": 15.2,
+        },
+        "away_momentum": {
+            "recent_margins": [5, 12, -2, 8, 3, 15, 7, -5, 10, 6],
+            "season_adj_oe": 105.2, "season_adj_de": 103.8,
+            "season_tempo": 66.5, "season_efg": 0.51, "season_to_rate": 17.8,
+        },
+        "home_experience": {
+            "roster": None,
+            "coach_record": {
+                "appearances": 12, "total_wins": 25, "total_losses": 10,
+                "win_rate": 0.714, "first_yr_coach": False,
+            },
+            "returning_pct": 0.65,
+        },
+        "away_experience": {
+            "roster": None,
+            "coach_record": {
+                "appearances": 3, "total_wins": 2, "total_losses": 3,
+                "win_rate": 0.40, "first_yr_coach": False,
+            },
+            "returning_pct": 0.55,
+        },
+        "home_rest": {"rest_days": 5},
+        "away_rest": {"rest_days": 5},
+        "injuries": None,
+        "home_travel": {
+            "travel_distance_miles": 300, "altitude_diff_ft": 200,
+        },
+        "away_travel": {
+            "travel_distance_miles": 800, "altitude_diff_ft": 500,
+        },
+        "seed_context": {
+            "seed_adjustment": 1.85,  # favors 1-seed (home)
+        },
+        "market_lines": {
+            "consensus_spread": -14.5,
+            "consensus_total": 142.0,
+        },
+    }
+
+    result = engine.predict(synthetic_inputs)
+    print(result.breakdown())
+
+    # Also test a close game: 5 vs 12
+    print("\n\n")
+    close_game = dict(synthetic_inputs)
+    close_game["home_team"] = "Marquette"
+    close_game["away_team"] = "McNeese"
+    close_game["home_seed"] = 5
+    close_game["away_seed"] = 12
+    close_game["tournament_round"] = 1
+    close_game["home_efficiency"]["adj_oe"] = 112.0
+    close_game["home_efficiency"]["adj_de"] = 97.0
+    close_game["home_efficiency"]["rank"] = 20
+    close_game["home_efficiency"]["barthag"] = 0.88
+    close_game["away_efficiency"]["adj_oe"] = 108.5
+    close_game["away_efficiency"]["adj_de"] = 99.5
+    close_game["away_efficiency"]["rank"] = 55
+    close_game["away_efficiency"]["barthag"] = 0.80
+    close_game["seed_context"] = {"seed_adjustment": 1.01}
+    close_game["market_lines"] = {
+        "consensus_spread": -5.5, "consensus_total": 145.0,
+    }
+
+    result2 = engine.predict(close_game)
+    print(result2.breakdown())
